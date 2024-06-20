@@ -1,0 +1,139 @@
+.TH UNL 1 "14 September 2000" "DB Tools" "DB TOOLS"
+.SH NAME
+unl \- unload data from Oracle, based on a select statment
+.SH SYNOPSIS
+.B unl
+[
+.BI -T
+]
+[
+.BI -t
+]
+[
+.BI -f \ delim
+]
+[
+.BI -r \ delim
+]
+[
+.BI -l \ rs
+[
+.BI -p \ padchar
+]
+]
+[
+.BI -o \ filename
+]
+[
+.BI -n \ numrecs
+]
+[
+.BI -k \ maxskip
+]
+[
+.BI -s \ sqlfile
+]
+[
+.BI -c \ connect_string
+]
+[
+.I select_sql
+]
+.SH DESCRIPTION
+.I unl
+executes the specified SQL select statement
+.RI ( select_sql )
+and produces
+on the standard output (default) a set of records.
+Records are delimited
+by newlines (default).
+By default, records are variable length with
+comma-delimited (default) fields.
+Optionally, the output can be fixed length
+records, containing fixed-length fields whose width corresponds to their
+database columns.
+If the specified record length is greater than the
+combined field widths, the record is padded with spaces (default).
+.PP
+The behavior of
+.I unl
+is affected by the following command line options:
+.TP
+.BI -t
+place a trailing delimiter at the end of the record.
+.TP
+.BI -T
+include time (to the second) for all date columns
+not explicitly formatted in
+.IB select_sql .
+.TP
+.BI -f \ delim
+specify a field delimiter
+.I delim
+(default=',')
+.TP
+.BI -r \ delim
+specify a record delimiter
+.I delim
+(default=newline)
+.TP
+.BI -l \ rs
+produce fixed-length records of size
+.IB rs .
+Fields are fixed
+to their database-defined size.
+No delimiters are placed between fields.
+.TP
+.BI -p \ padchar
+use
+.I padchar
+to pad the fixed length records (default=space).
+.TP
+.BI -o \ filename
+send the output to
+.IB filename .
+.TP
+.BI -n \ numrecs
+unload at most
+.I numrecs
+records.
+.TP
+.BI -k \ maxskip
+randomly skip (at most)
+.I maxskip
+records between successive database fetches.
+.TP
+.BI -s \ sqlfile
+read the SQL select statement from the
+.IB sqlfile .
+Any statement specified on the command line will be ignored.
+If
+.I sqlfile
+is -, then the standard input is read.
+.TP
+.BI -s \ connect_string
+use
+.I connect_string
+to connect to the database instance.
+The default connect string is "/".
+.PP
+The remaining arguments to
+.I unl
+are taken as the SQL select statement which
+will be executed to produce the unloaded data.
+These arguments are concatenated in the order specified,
+with spaces between them, to form the select statement.
+Remember to be careful to quote characters that might
+be special to the shell (e.g. '*').
+.SH NOTES
+All date columns that are not explicitly formatted in
+.IB select_sql
+are formatted as
+.BI YYYY-MM-DD ,
+unless the
+.IB -T
+option is used, in which case the format is
+.BI YYYY-MM-DD\ HH:MM:SS .
+.SH DIAGNOSTICS
+Any generated error message will be displayed on standard error,
+so as not to conflict with the output.

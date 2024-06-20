@@ -1,0 +1,485 @@
+/*
+ *        Filename: unl.pc
+ *   Creation Date: 07/02/1996
+ *          Author: Gabe Saporito
+ *
+ *     Description: The main module and workings for the unl tool, which
+ *                  unloads an Oracle database, based on an SQL select stmt.
+ *
+ *       Functions: int main(int argc,char *argv[]);
+ *                  --  main function for unl.  argument checking, etc.
+ *                      void ProcOptions(int ,char * []);
+ *                  --  command line option processing
+ *                  void ConnectToDB(void);
+ *                  --  connect to the Oracle database
+ *                  int Unl(char *stmt,int listSiz);
+ *                  --  SQL driver for unl.  Prepares, sets up and uses the
+ *                  --  dynamic SQL, fetches records for printing
+ *                  void CoerceSelList(SQLDA *unloadDA);
+ *                  --  coerces the dynamic SQL select list information to
+ *                  --  make returned data more usable.  Also allocates the
+ *                  --  value and indicator variable arrays.
+ *                  void FreeSelList(SQLDA *unloadDA);
+ *                  --  Frees data allocated by Unl and CoerceSelList
+ *                  void UnloadRec(SQLDA *unloadDA,short T[]);
+ *                  --  Prints a fetched record
+ *
+ *         Changes:
+ *
+ *            Date:   $Date: 07/02/1996 16:19:49 $
+ *            Name: $Author: gabes $
+ *        Revision:
+ *     Description:
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <ctype.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <string.h>
+#include <stdarg.h>
+#include <time.h>
+#include "unload.h"
+
+#ifdef CPLUSPLUS_KLUDGE
+/*
+ * See kludge.c for details on this mess
+ */
+#define sqlcex		kldg_sqlcex
+#define sqlprc		kldg_sqlprc
+#define sqlald		kldg_sqlald
+#define sqlclu		kldg_sqlclu
+#endif
+
+EXEC SQL INCLUDE sqlca;
+EXEC SQL INCLUDE sqlda;
+
+/*
+ * Function prototypes for PRO*C stuff
+ */
+extern struct SQLDA *sqlald(int,size_t,size_t);
+extern void  sqlclu(struct SQLDA *);
+extern void  sqlprc(unsigned long *,int *,int *);
+extern void sqlcex(unsigned long *, struct sqlexd *, const struct sqlcxp *);
+
+/*
+ * unl.pc function prototypes
+ */
+void ConnectToDB(void);
+int Unl(char *,int);
+void CoerceSelList(SQLDA *);
+void FreeSelList(SQLDA *);
+void UnloadRec(SQLDA *,short []);
+
+/*
+ * declared in and used by functions in message.c
+ */
+extern char *pgmName;
+
+/*
+ * Command-line option flags
+ */
+int		flgTrailingDelim = 0;	/* no trailing delimiter by default */
+int		flgIncludeTime = 0;		/* no trailing delimiter by default */
+char	*sqlFileName = NULL;	/* use cmd-line for SQL when this is NULL */
+int		unloadMax = -1;			/* no limit when this is <= 0 */
+int		skipMax = -1;			/* no skip when this is <= 0 */
+int		recLen = 0;				/* VL records when this is <= 0 */
+FILE	*outFp = NULL;
+char	fldDelim = ',';
+char	recDelim = '\n';
+char	padChar = ' ';
+char	*sqlConnect = "/";
+
+#ifdef DBUG
+int		dbugFlag = 0;
+#endif
+
+main(int argc,char *argv[])
+{
+	char *stmt;
+	int stmtLen;
+	int listSiz = 0;
+	int numRecs;
+	char *s;
+	extern int opterr;
+
+	outFp = stdout;
+
+	pgmName = "UNL";
+	opterr = 0;
+ 
+/*
+ *	process command line arguments
+ */
+	ProcOptions(argc,argv);
+
+/*
+ *	build the SQL statement from stdin, file, command line
+ */
+	stmt = BuildStmt(argc,argv,&stmtLen);
+
+/*
+ *	Connect to database before doing any more processing.
+ */
+	ConnectToDB();
+
+/*
+ *	get a generous estimate for the size of the select list so that Unl can
+ *	be sure to allocate enough SQLDA space.
+ */
+	listSiz = GetSelListSiz(stmt);
+
+/*
+ *	Unload the data, based on the stmt and listSiz
+ */
+	numRecs = Unl(stmt,listSiz);
+	if (numRecs < 0)				/* Unl failed, msg already displayed */
+		exit(-1);
+
+/*
+ *	Free allocated space for stmt
+ */
+	FreeStmt(stmt);
+
+/*
+ *	Print the count message
+ */
+	UnlMessage(UI_UNLCNT,numRecs);
+	exit(0);
+}
+
+/*
+ * connect to the Oracle database.  If connect fails, print message & exit
+ */
+void ConnectToDB(void)
+{
+EXEC SQL BEGIN DECLARE SECTION;
+	VARCHAR connectString[400];
+EXEC SQL END DECLARE SECTION;
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: connecting to Oracle...\n");
+#endif
+
+	strcpy((char *)connectString.arr,sqlConnect);
+	connectString.len = strlen(sqlConnect);
+	EXEC SQL CONNECT :connectString;
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+	if (flgIncludeTime)
+	{
+		EXEC SQL ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
+	}
+	else
+	{
+		EXEC SQL ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD';
+	}
+
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: connected to Oracle\n");
+#endif
+}
+
+/*
+ * unload the data files based on the SQL select in stmt, using a SQLDA struct
+ * allocated based on generous estimate in listSiz
+ */
+int Unl(char *stmt,int listSiz)
+{
+EXEC SQL BEGIN DECLARE SECTION;
+	VARCHAR sel_stmt[4096];
+EXEC SQL END DECLARE SECTION;
+
+	int i = 0;
+	int numFetched = 0;		/* number of recs actually fetched */
+	int numUnloaded = 0;	/* number of recs unloaded <= numFetched */
+	int skipVal = -1;		/* random # of recs skipped between unl's */
+	SQLDA *unloadDA;		/* ptr to the dynamic SQL structure */
+	short *holdT;			/* SQL type holder, we coerce the types to STRING */
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: select list contains at most %d items\n",listSiz);
+#endif
+
+/*
+ *	set up the statement to be prepared
+ */
+	strcpy((char *)sel_stmt.arr,stmt);
+	sel_stmt.len = strlen(stmt);
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: allocating DA...\n");
+#endif
+
+/*
+ *	allocate the SQLDA space
+ */
+	unloadDA = sqlald(listSiz*2,listSiz,listSiz);
+	if (!unloadDA)
+	{
+		UnlMessage(UF_MEMORY);
+	}
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: EXEC SQL PREPARE...\n");
+#endif
+
+/*
+ *	Basically, when using dynamic SQL, the order of processing is always the
+ *	same:  PREPARE the statemet, DECLARE the cursor, DESCRIBE for the bindlist,
+ *	OPEN the cursor, DESCRIBE for the statement list, do any type/length
+ *	coersion that is needed, FETCH rows from the cursor, CLOSE the cursor.
+ *	For this excersize, we don't have a bindlist, so that step is skipped.  If
+ *	any of the SQL fails, we will print the SQL message and exit since we can't
+ *	do much without the SQL!
+ */
+	EXEC SQL PREPARE s_sel_stmt FROM :sel_stmt;
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: EXEC SQL DECLARE...\n");
+#endif
+
+	EXEC SQL DECLARE c_sel_stmt CURSOR FOR s_sel_stmt;
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: EXEC SQL OPEN...\n");
+#endif
+
+	EXEC SQL OPEN c_sel_stmt;
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: EXEC SQL DESCRIBE...\n");
+#endif
+
+	EXEC SQL DESCRIBE SELECT LIST FOR s_sel_stmt INTO unloadDA;
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+#ifdef DBUG
+	if (dbugFlag)
+		fprintf(stderr,"unl: DESCRIBE found %d items in select list\n",
+			unloadDA->F);
+#endif
+
+/*
+ *	Since we will coerce the data type of all columns to be STRING, we want
+ *	to preserve the original type information.  We will need this when we
+ *	format the rows for fixed lengtn records.
+ */
+	holdT = (short *)calloc(unloadDA->F,sizeof(short));
+	if (!holdT)
+	{
+		UnlMessage(UF_MEMORY);
+	}
+	for (i=0 ; i < unloadDA->F ; i++)
+		holdT[i] = unloadDA->T[i];
+
+	CoerceSelList(unloadDA);		/* coerce the select list types and lens */
+
+	if (skipMax > 0)				/* setup for skipping records */
+	{
+		srand((unsigned int)time(NULL));
+		skipVal = (rand() % skipMax) + 1;
+	}
+
+	for ( ; ; )
+	{
+		if (unloadMax > 0 && numUnloaded == unloadMax)
+			break;		/* if a threshold is set, stop when we reach it */
+
+		EXEC SQL FETCH c_sel_stmt USING DESCRIPTOR unloadDA;
+		if (sqlca.sqlcode)
+			break;
+
+		numFetched += 1;
+
+		if (skipMax > 0 && (numFetched % skipVal))
+			continue;			/* if skip is on, should we skip this rec? */
+
+		UnloadRec(unloadDA,holdT);	/* print the record */
+		numUnloaded += 1;
+
+		if (skipMax > 0)		/* if skip is on, set new random skip value */
+			skipVal = (rand() % skipMax) + 1;
+	}
+
+	free(holdT);				/* free the pre-coerced type array */
+	FreeSelList(unloadDA);		/* free the select list values and indicators */
+	sqlclu(unloadDA);			/* free the SQLDA for the select list */
+
+	if (sqlca.sqlcode && sqlca.sqlcode != SQLNOTFOUND)
+	{
+		SQLMessage(E_FATAL);	/* FETCH FAILED */
+	}
+
+	EXEC SQL CLOSE c_sel_stmt;
+	if (sqlca.sqlcode)
+	{
+		SQLMessage(E_FATAL);
+	}
+
+	return(numUnloaded);
+}
+
+/*
+ *	Allocate memory for data and indicator variables and coerce the types and
+ *	lengths appropriately.
+ */
+void CoerceSelList(SQLDA *unlDA)
+{
+	int i;
+	int prec = 0;
+	int scal = 0;
+	int nullok;
+
+	unlDA->N = unlDA->F;				/* set actual select list size */
+	for (i=0 ; i < unlDA->F ; i++)
+	{
+	/*
+	 *	coerce the length of the variables
+	 */
+		sqlnul(&unlDA->T[i],&unlDA->T[i],&nullok);
+
+		switch (unlDA->T[i])
+		{
+		case 2:							/* NUMBER(n) */
+			sqlprc((unsigned long *)&unlDA->L[i],&prec,&scal);
+			if (prec == 0)
+				prec = 38;
+			if (scal < 0)
+				prec += -scal;
+			unlDA->L[i] = prec + 2;
+			break;
+		case 8:							/* LONG */
+			unlDA->L[i] = 240;
+			break;
+		case 11:						/* ROWID */
+			unlDA->L[i] = 18;
+			break;
+		case 12:						/* DATE */
+			unlDA->L[i] = flgIncludeTime ? 22 : 14;
+			break;
+		case 24:						/* LONG RAW */
+			unlDA->L[i] = 240;
+			break;
+		case 1:							/* VARCHAR2 */
+		case 23:						/* RAW */
+			break;
+		}
+
+	/*
+	 *	For our purposes, it makes sense to coerce the types of all columns to
+	 *	type STRING, because it works well in C, and we only need to be able to
+	 *	print the values.  So we set the type to STRING (except for LONG RAWs),
+	 *	and increase the length of the data by 1 to hold the NULL character.
+	 */
+		if (unlDA->T[i] != 24)
+		{
+			unlDA->T[i] = 5;		/* coerce all types to STRING */
+			unlDA->L[i] += 1;		/* make room for NULL */
+		}
+	/*
+	 *	Allocate space for the data variables (V[i]) and indicator variables
+	 *	(I[i]).
+	 */
+		unlDA->V[i] = (char *)malloc(unlDA->L[i]);
+		if (!unlDA->V[i])
+		{
+			UnlMessage(UF_MEMORY);
+		}
+		unlDA->I[i] = (short *)malloc(sizeof(short));
+		if (!unlDA->I[i])
+		{
+			UnlMessage(UF_MEMORY);
+		}
+	}
+}
+
+/*
+ *	Free the space allocated for the data and indicator variables
+ */
+void FreeSelList(SQLDA *unlDA)
+{
+	int i;
+
+	for (i=0 ; i < unlDA->F ; i++)
+	{
+		free(unlDA->V[i]);
+		free(unlDA->I[i]);
+	}
+}
+
+/*
+ *	Actually print the unloaded record
+ */
+void UnloadRec(SQLDA *unlDA,short T[])
+{
+	int i = 0;
+	int rl = 0;		/* current record length, used for fixed length records */
+	char *s = NULL;
+
+	for (i=0 ; i < unlDA->F ; i++)		/* loop over each column */
+	{
+		if (recLen > 0)					/* Fixed length record unload */
+		{
+			fprintf(outFp,T[i] == 2 ? "%*s" : "%-*s",
+				unlDA->L[i]-1,Value(unlDA,i));
+			rl += (unlDA->L[i]-1);
+		}
+		else							/* Variable length, delimited fields */
+		{
+			if (i)
+				putc(fldDelim,outFp);
+
+			fprintf(outFp,"%s",ltrim(rtrim(Value(unlDA,i))));
+		}
+	}
+	if (recLen > 0)						/* pad fixed length records */
+	{
+		while (rl < recLen)
+		{
+			putc(padChar,outFp);
+			rl++;
+		}
+	}
+
+	if (recLen <= 0 && flgTrailingDelim)
+		putc(fldDelim,outFp);
+
+	putc(recDelim,outFp);
+}
